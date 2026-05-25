@@ -5,8 +5,18 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import settings
-from app.models import ServiceStatus, ServiceStatusResponse
-from app.scraper import normalize_service, status_cache, status_label
+from app.models import (
+    CriticalServiceItem,
+    CriticalServicesResponse,
+    ServiceStatus,
+    ServiceStatusResponse,
+)
+from app.scraper import (
+    fetch_critical_services,
+    normalize_service,
+    status_cache,
+    status_label,
+)
 
 
 @asynccontextmanager
@@ -83,6 +93,61 @@ def _get_status(service: str, refresh: bool) -> ServiceStatusResponse:
         checked_at=result.checked_at,
         cached=cached,
     )
+
+
+def _get_critical_services(count: int) -> CriticalServicesResponse:
+    try:
+        result = fetch_critical_services(limit=count)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha ao consultar serviços críticos no Downdetector: {exc}",
+        ) from exc
+
+    return CriticalServicesResponse(
+        services=[
+            CriticalServiceItem(
+                service=service.service,
+                status=service.status,
+                label=service.label,
+                message=service.message,
+                source_url=service.source_url,
+                app_image_url=service.app_image_url,
+            )
+            for service in result.services
+        ],
+        image_url=result.image_url,
+        source_url=result.source_url,
+        checked_at=result.checked_at,
+        cached=False,
+    )
+
+
+@app.get(
+    "/critical/services",
+    response_model=CriticalServicesResponse,
+    summary="Serviços mais críticos",
+    description=(
+        "Consulta a tela principal do Downdetector e retorna os serviços mais "
+        "críticos com uma imagem JPEG dos cards lado a lado."
+    ),
+)
+def critical_services(
+    count: int | None = Query(
+        None,
+        ge=1,
+        le=10,
+        description="Quantidade máxima de serviços críticos retornados.",
+    ),
+    limit: int | None = Query(
+        None,
+        ge=1,
+        le=10,
+        include_in_schema=False,
+    ),
+    _auth: None = Depends(require_api_token),
+) -> CriticalServicesResponse:
+    return _get_critical_services(count or limit or 5)
 
 
 @app.get(

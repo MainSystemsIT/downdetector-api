@@ -30,3 +30,26 @@ class ServiceStatusResponse(BaseModel):
     )
     checked_at: datetime
     cached: bool = False
+
+
+class CriticalServiceItem(BaseModel):
+    service: str = Field(description="Identificador do serviço no Downdetector")
+    status: ServiceStatus
+    label: str = Field(description="Rótulo legível em português")
+    message: str = Field(description="Texto do card exibido no Downdetector")
+    source_url: str
+    app_image_url: str | None = Field(
+        default=None,
+        description="URL da imagem/logo do aplicativo no Downdetector",
+    )
+
+
+class CriticalServicesResponse(BaseModel):
+    services: list[CriticalServiceItem]
+    image_url: str | None = Field(
+        default=None,
+        description="Data URL JPEG com os cards críticos lado a lado",
+    )
+    source_url: str
+    checked_at: datetime
+    cached: bool = False

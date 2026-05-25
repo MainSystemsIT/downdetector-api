@@ -7,6 +7,7 @@ API em Python/FastAPI para consultar o status de serviços monitorados pelo [Dow
 - Consulta status por slug do Downdetector, como `whatsapp`, `youtube`, `instagram` ou `openai`.
 - Retorna status normalizado: `ok`, `warning` ou `down`.
 - Gera imagem JPEG em base64 do card do serviço na tela principal do Downdetector.
+- Gera uma imagem JPEG única com os cards dos serviços mais críticos lado a lado.
 - Suporta localidade/domínio configurável, como `downdetector.com.br`, `downdetector.com` e outros.
 - Possui cache por serviço para reduzir chamadas ao Downdetector.
 - Protege os endpoints de consulta com token via `Authorization: Bearer`.
@@ -141,6 +142,7 @@ O endpoint `/health` não exige autenticação para facilitar health checks.
 | Método | Rota | Autenticação | Descrição |
 |--------|------|--------------|-----------|
 | `GET` | `/health` | Não | Health check da API. |
+| `GET` | `/critical/services` | Sim | Até 5 serviços mais críticos e imagem dos cards lado a lado. |
 | `GET` | `/{service}/status` | Sim | Status completo do serviço. |
 | `GET` | `/{service}/is-up` | Sim | Resposta booleana para disponibilidade. |
 
@@ -152,6 +154,7 @@ Exemplos:
 GET /youtube/status
 GET /whatsapp/status?refresh=true
 GET /instagram/is-up
+GET /critical/services?count=5
 ```
 
 Parâmetros:
@@ -159,6 +162,7 @@ Parâmetros:
 | Parâmetro | Descrição |
 |-----------|-----------|
 | `refresh=true` | Ignora o cache e força uma nova consulta ao Downdetector. |
+| `count=5` | Usado em `/critical/services`; aceita de 1 a 10 serviços. |
 
 ## Exemplo De Resposta
 
@@ -179,6 +183,29 @@ Parâmetros:
 ```
 
 O campo `failure_graph_image_url` contém o card completo do serviço na tela principal do Downdetector, convertido para JPEG em base64.
+
+`GET /critical/services`
+
+```json
+{
+  "services": [
+    {
+      "service": "openai",
+      "status": "down",
+      "label": "ruim",
+      "message": "Reportes dos usuários para OpenAI nas últimas 24 horas - enfrenta problemas",
+      "source_url": "https://downdetector.com.br/fora-do-ar/openai/",
+      "app_image_url": "https://..."
+    }
+  ],
+  "image_url": "data:image/jpeg;base64,...",
+  "source_url": "https://downdetector.com.br/",
+  "checked_at": "2026-05-24T19:09:09.191581Z",
+  "cached": false
+}
+```
+
+O campo `image_url` contém uma única imagem JPEG em base64 com os cards críticos lado a lado.
 
 ## Status
 

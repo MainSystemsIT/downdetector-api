@@ -25,13 +25,13 @@ _WARNING_PATTERNS = (
     r"possible problems",
     r"poss[ií]veis problemas",
     r"possivel problema",
+    r"enfrenta problemas",
 )
 _DOWN_PATTERNS = (
     r"problems at",
     r"(?<!no current )problems with",
     r"having problems",
     r"problemas (?:em|no|na|com)",
-    r"enfrenta problemas",
     r"est[aá] tendo problemas",
     r"indicate problems",
     r"indicam problemas",
@@ -49,6 +49,25 @@ class ScrapeResult:
     checked_at: datetime
     app_image_url: str | None = None
     failure_graph_image_url: str | None = None
+
+
+@dataclass
+class CriticalServiceCard:
+    service: str
+    status: ServiceStatus
+    label: str
+    message: str
+    source_url: str
+    app_image_url: str | None
+    card_markup: str
+
+
+@dataclass
+class CriticalServicesResult:
+    services: list[CriticalServiceCard]
+    image_url: str | None
+    source_url: str
+    checked_at: datetime
 
 
 def normalize_service(service: str) -> str:
@@ -188,7 +207,7 @@ if not markup:
 with sync_playwright() as playwright:
     browser = playwright.chromium.launch(headless=True)
     try:
-        page = browser.new_page(viewport={"width": 360, "height": 320})
+        page = browser.new_page(viewport={"width": 1800, "height": 360})
         page.set_content(
             f'''
             <!doctype html>
@@ -205,6 +224,13 @@ with sync_playwright() as playwright:
                   }}
                   #card-root {{
                     display: inline-block;
+                    background: #fff;
+                    padding: 0;
+                  }}
+                  #card-root .critical-cards-row {{
+                    display: flex;
+                    align-items: stretch;
+                    gap: 16px;
                     background: #fff;
                     padding: 0;
                   }}
@@ -260,7 +286,7 @@ with sync_playwright() as playwright:
                     margin: 0 auto 8px;
                     padding: 4px 0;
                     box-sizing: border-box;
-                    color: #d71920;
+                    color: #f59e0b;
                     overflow: visible;
                   }}
                   #card-root svg {{
@@ -272,7 +298,7 @@ with sync_playwright() as playwright:
                   #card-root [role="img"] path,
                   #card-root [role="img"] line,
                   #card-root [role="img"] polyline {{
-                    stroke: #d71920 !important;
+                    stroke: currentColor !important;
                     fill: none !important;
                     opacity: 1 !important;
                     visibility: visible !important;
@@ -287,21 +313,53 @@ with sync_playwright() as playwright:
         )
         page.evaluate(
             '''() => {
+                const colorForGraph = (element) => {
+                    const label = (element.getAttribute('aria-label') || '').toLowerCase();
+                    if (
+                        label.includes('sem problemas') ||
+                        label.includes('no current problems')
+                    ) {
+                        return '#16a34a';
+                    }
+                    if (
+                        label.includes('possíveis problemas') ||
+                        label.includes('possiveis problemas') ||
+                        label.includes('possible problems') ||
+                        label.includes('enfrenta problemas')
+                    ) {
+                        return '#f59e0b';
+                    }
+                    return '#d71920';
+                };
+
                 document
-                    .querySelectorAll('#card-root [role="img"] svg path, #card-root [role="img"] svg line, #card-root [role="img"] svg polyline')
+                    .querySelectorAll('#card-root [role="img"]')
                     .forEach((element) => {
-                        const stroke = element.getAttribute('stroke');
-                        if (!stroke || stroke.includes('var(')) {
-                            element.setAttribute('stroke', '#d71920');
-                        }
-                        element.style.stroke = '#d71920';
-                        element.style.fill = 'none';
+                        const color = colorForGraph(element);
+                        element.style.setProperty('color', color, 'important');
+                        element.style.display = 'block';
+                        element.style.overflow = 'visible';
                         element.style.opacity = '1';
                         element.style.visibility = 'visible';
                     });
 
                 document
-                    .querySelectorAll('#card-root [role="img"], #card-root [role="img"] svg')
+                    .querySelectorAll('#card-root [role="img"] svg path, #card-root [role="img"] svg line, #card-root [role="img"] svg polyline')
+                    .forEach((element) => {
+                        const graph = element.closest('[role="img"]');
+                        const color = graph ? colorForGraph(graph) : '#f59e0b';
+                        const stroke = element.getAttribute('stroke');
+                        if (!stroke || stroke.includes('var(')) {
+                            element.setAttribute('stroke', color);
+                        }
+                        element.style.setProperty('stroke', color, 'important');
+                        element.style.setProperty('fill', 'none', 'important');
+                        element.style.setProperty('opacity', '1', 'important');
+                        element.style.setProperty('visibility', 'visible', 'important');
+                    });
+
+                document
+                    .querySelectorAll('#card-root [role="img"] svg')
                     .forEach((element) => {
                         element.style.display = 'block';
                         element.style.overflow = 'visible';
@@ -451,6 +509,14 @@ def _card_html_to_jpeg_data_url(card_markup: str | None) -> str | None:
     return f"data:image/jpeg;base64,{encoded}"
 
 
+def _cards_html_to_jpeg_data_url(card_markups: list[str]) -> str | None:
+    if not card_markups:
+        return None
+
+    markup = '<div class="critical-cards-row">' + "".join(card_markups) + "</div>"
+    return _card_html_to_jpeg_data_url(markup)
+
+
 def _extract_svg_by_selectors(page, selectors: tuple[str, ...]) -> str | None:
     for selector in selectors:
         data_url = _svg_to_jpeg_data_url(page.css(selector).get())
@@ -484,6 +550,70 @@ def _company_card_markup(card_link) -> str | None:
     return card_link.get()
 
 
+def _service_slug_from_card_link(card_link, fallback_url: str) -> str | None:
+    href = getattr(card_link, "attrib", {}).get("href")
+    if not href:
+        return None
+
+    path = urlparse(urljoin(fallback_url, href)).path.rstrip("/")
+    slug = path.rsplit("/", 1)[-1].strip().lower()
+    if not SERVICE_SLUG_PATTERN.match(slug):
+        return None
+
+    return slug
+
+
+def _critical_rank(status: ServiceStatus) -> int:
+    return {
+        ServiceStatus.DOWN: 0,
+        ServiceStatus.WARNING: 1,
+        ServiceStatus.OK: 2,
+        ServiceStatus.UNKNOWN: 2,
+    }[status]
+
+
+def _extract_service_card(
+    page,
+    fallback_url: str,
+    card_link,
+) -> CriticalServiceCard | None:
+    slug = _service_slug_from_card_link(card_link, fallback_url)
+    if not slug:
+        return None
+
+    graph_block = card_link.css("[role='img']")
+    if not graph_block:
+        return None
+
+    message = getattr(graph_block[0], "attrib", {}).get("aria-label")
+    if not message:
+        return None
+
+    markup = _company_card_markup(card_link)
+    if not markup:
+        return None
+
+    href = getattr(card_link, "attrib", {}).get("href")
+    source_url = urljoin(fallback_url, href) if href else fallback_url
+    card_images = card_link.css("img")
+    app_image_url = (
+        _image_url_from_element(page, fallback_url, card_images[0])
+        if card_images
+        else None
+    )
+    status = classify_status(message)
+
+    return CriticalServiceCard(
+        service=slug,
+        status=status,
+        label=status_label(status),
+        message=message,
+        source_url=source_url,
+        app_image_url=app_image_url,
+        card_markup=markup,
+    )
+
+
 def _extract_card_image_urls(
     page,
     fallback_url: str,
@@ -493,24 +623,21 @@ def _extract_card_image_urls(
         if not _card_matches_service(card_link, fallback_url, service):
             continue
 
-        href = getattr(card_link, "attrib", {}).get("href")
-        source_url = urljoin(fallback_url, href) if href else fallback_url
-        app_image_url = None
-        card_images = card_link.css("img")
-        if card_images:
-            app_image_url = _image_url_from_element(page, fallback_url, card_images[0])
-
+        card = _extract_service_card(page, fallback_url, card_link)
+        if card is None:
+            return None, None, None, None
         graph_block = card_link.css("[role='img']")
-        message = None
-        if graph_block:
-            message = getattr(graph_block[0], "attrib", {}).get("aria-label")
-
         graph_svg = graph_block[0].css("svg").get() if graph_block else None
         graph_svg = graph_svg or card_link.css("svg").get()
         failure_graph_image_url = _card_html_to_jpeg_data_url(
-            _company_card_markup(card_link)
+            card.card_markup
         ) or _svg_to_jpeg_data_url(graph_svg)
-        return app_image_url, failure_graph_image_url, message, source_url
+        return (
+            card.app_image_url,
+            failure_graph_image_url,
+            card.message,
+            card.source_url,
+        )
 
     return None, None, None, None
 
@@ -580,6 +707,57 @@ def _fetch_service_card_result(service: str) -> ScrapeResult | None:
         checked_at=datetime.now(timezone.utc),
         app_image_url=app_image_url,
         failure_graph_image_url=failure_graph_image_url,
+    )
+
+
+def fetch_critical_services(
+    limit: int = 5,
+    max_attempts: int = 3,
+) -> CriticalServicesResult:
+    home_url = f"{settings.downdetector_base_url().rstrip('/')}/"
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            page = _get_session().fetch(home_url)
+            if getattr(page, "status", 200) >= 400:
+                raise RuntimeError(
+                    f"Downdetector retornou HTTP {page.status} para {home_url}"
+                )
+            break
+        except Exception as exc:
+            last_error = exc
+            _reset_session()
+            if attempt < max_attempts:
+                time.sleep(3 * attempt)
+    else:
+        raise RuntimeError(
+            f"Falha ao consultar a tela principal do Downdetector: {last_error}"
+        ) from last_error
+
+    ranked_cards: list[tuple[int, int, CriticalServiceCard]] = []
+    seen_services: set[str] = set()
+
+    for index, card_link in enumerate(page.css("a[href]")):
+        card = _extract_service_card(page, home_url, card_link)
+        if card is None or card.service in seen_services:
+            continue
+
+        seen_services.add(card.service)
+        if card.status not in (ServiceStatus.DOWN, ServiceStatus.WARNING):
+            continue
+
+        ranked_cards.append((_critical_rank(card.status), index, card))
+
+    ranked_cards.sort(key=lambda item: (item[0], item[1]))
+    services = [card for _rank, _index, card in ranked_cards[:limit]]
+    image_url = _cards_html_to_jpeg_data_url([card.card_markup for card in services])
+
+    return CriticalServicesResult(
+        services=services,
+        image_url=image_url,
+        source_url=home_url,
+        checked_at=datetime.now(timezone.utc),
     )
 
 
