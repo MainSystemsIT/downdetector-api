@@ -68,6 +68,7 @@ class CriticalServicesResult:
     image_url: str | None
     source_url: str
     checked_at: datetime
+    message: str | None = None
 
 
 def normalize_service(service: str) -> str:
@@ -899,4 +900,59 @@ class StatusCache:
         return result, False
 
 
+class CriticalServicesCache:
+    def __init__(self, ttl_seconds: int) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._entries: dict[int, tuple[CriticalServicesResult, float]] = {}
+        self._lock = threading.Lock()
+
+    def get(
+        self,
+        limit: int,
+        force_refresh: bool = False,
+    ) -> tuple[CriticalServicesResult, bool]:
+        now = time.monotonic()
+
+        with self._lock:
+            cached_entry = self._entries.get(limit)
+            if not force_refresh and cached_entry is not None:
+                result, expires_at = cached_entry
+                if now < expires_at:
+                    return result, True
+
+        try:
+            result = fetch_critical_services(limit=limit)
+        except Exception as exc:
+            with self._lock:
+                cached_entry = self._entries.get(limit)
+
+            if cached_entry is not None:
+                result, _expires_at = cached_entry
+                result.message = (
+                    "Downdetector bloqueou a consulta atual; retornando último "
+                    "resultado em cache."
+                )
+                return result, True
+
+            return (
+                CriticalServicesResult(
+                    services=[],
+                    image_url=None,
+                    source_url=f"{settings.downdetector_base_url().rstrip('/')}/",
+                    checked_at=datetime.now(timezone.utc),
+                    message=(
+                        "Downdetector bloqueou a consulta atual e ainda não há "
+                        f"cache disponível: {exc}"
+                    ),
+                ),
+                False,
+            )
+
+        with self._lock:
+            self._entries[limit] = (result, now + self.ttl_seconds)
+
+        return result, False
+
+
 status_cache = StatusCache(settings.cache_ttl_seconds)
+critical_services_cache = CriticalServicesCache(settings.cache_ttl_seconds)

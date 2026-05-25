@@ -52,4 +52,8 @@ class CriticalServicesResponse(BaseModel):
     )
     source_url: str
     checked_at: datetime
+    message: str | None = Field(
+        default=None,
+        description="Mensagem informativa quando a consulta usa fallback/cache",
+    )
     cached: bool = False

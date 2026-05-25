@@ -200,11 +200,16 @@ O campo `failure_graph_image_url` contém o card completo do serviço na tela pr
   "image_url": "data:image/jpeg;base64,...",
   "source_url": "https://downdetector.com.br/",
   "checked_at": "2026-05-24T19:09:09.191581Z",
+  "message": null,
   "cached": false
 }
 ```
 
 O campo `image_url` contém uma única imagem JPEG em base64 com os cards críticos lado a lado.
+Se o Downdetector bloquear a consulta atual, o endpoint tenta retornar o último
+resultado em cache. Quando ainda não houver cache, a resposta vem com
+`services: []`, `image_url: null` e uma mensagem explicando o bloqueio, sem
+transformar a chamada em erro `502`.
 
 ## Status
 

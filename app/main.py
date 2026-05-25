@@ -12,7 +12,7 @@ from app.models import (
     ServiceStatusResponse,
 )
 from app.scraper import (
-    fetch_critical_services,
+    critical_services_cache,
     normalize_service,
     status_cache,
     status_label,
@@ -95,14 +95,8 @@ def _get_status(service: str, refresh: bool) -> ServiceStatusResponse:
     )
 
 
-def _get_critical_services(count: int) -> CriticalServicesResponse:
-    try:
-        result = fetch_critical_services(limit=count)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Falha ao consultar serviços críticos no Downdetector: {exc}",
-        ) from exc
+def _get_critical_services(count: int, refresh: bool) -> CriticalServicesResponse:
+    result, cached = critical_services_cache.get(count, force_refresh=refresh)
 
     return CriticalServicesResponse(
         services=[
@@ -119,7 +113,8 @@ def _get_critical_services(count: int) -> CriticalServicesResponse:
         image_url=result.image_url,
         source_url=result.source_url,
         checked_at=result.checked_at,
-        cached=False,
+        message=result.message,
+        cached=cached,
     )
 
 
@@ -145,9 +140,13 @@ def critical_services(
         le=10,
         include_in_schema=False,
     ),
+    refresh: bool = Query(
+        False,
+        description="Ignora o cache e busca os serviços críticos novamente.",
+    ),
     _auth: None = Depends(require_api_token),
 ) -> CriticalServicesResponse:
-    return _get_critical_services(count or limit or 5)
+    return _get_critical_services(count or limit or 5, refresh)
 
 
 @app.get(
