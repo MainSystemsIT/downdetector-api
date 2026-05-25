@@ -802,15 +802,22 @@ def _get_session() -> StealthySession:
     global _session
     with _session_lock:
         if _session is None:
-            _session = StealthySession(
-                headless=settings.headless,
-                network_idle=True,
-                solve_cloudflare=True,
-                timeout=settings.request_timeout_seconds * 1000,
-                locale=settings.browser_locale,
-                wait_selector="#company-status h1, h1",
-                wait_selector_state="visible",
-            )
+            session_kwargs = {
+                "headless": settings.headless,
+                "network_idle": True,
+                "solve_cloudflare": True,
+                "timeout": settings.request_timeout_seconds * 1000,
+                "locale": settings.browser_locale,
+                "wait_selector": "#company-status h1, h1",
+                "wait_selector_state": "visible",
+                "block_webrtc": bool(settings.downdetector_proxy),
+            }
+            if settings.downdetector_proxy:
+                session_kwargs["proxy"] = settings.downdetector_proxy
+            if settings.browser_user_data_dir:
+                session_kwargs["user_data_dir"] = settings.browser_user_data_dir
+
+            _session = StealthySession(**session_kwargs)
             _session.start()
         return _session
 

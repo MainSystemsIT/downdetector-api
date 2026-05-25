@@ -55,6 +55,8 @@ Variáveis principais:
 | `CACHE_TTL_SECONDS` | Tempo de cache por serviço, em segundos. |
 | `REQUEST_TIMEOUT_SECONDS` | Timeout das chamadas com navegador, em segundos. |
 | `HEADLESS` | Define se o navegador roda em modo headless. |
+| `DOWNDETECTOR_PROXY` | Opcional. Proxy HTTP/HTTPS/SOCKS usado pelo navegador quando o IP do servidor é bloqueado. |
+| `BROWSER_USER_DATA_DIR` | Opcional. Diretório persistente do perfil/cookies do navegador. Nos compose files é `/browser-data`. |
 | `TRAEFIK_HOST` | Domínio público usado no Compose com Traefik. |
 
 Nunca publique seu `.env` real. O repositório já ignora esse arquivo por padrão.
@@ -223,6 +225,7 @@ transformar a chamada em erro `502`.
 ## Observações
 
 - O Downdetector pode bloquear ou alterar páginas sem aviso; por isso o scraper usa navegador headless e fallback pela tela principal.
+- Em VPS/datacenter, o Cloudflare pode bloquear o IP mesmo após resolver o Turnstile. Nesses casos, configure `DOWNDETECTOR_PROXY` com um proxy confiável.
 - A primeira consulta pode levar mais tempo por causa da inicialização do Chromium.
 - Cada serviço tem cache independente definido por `CACHE_TTL_SECONDS`.
 - Este projeto não é afiliado ao Downdetector.

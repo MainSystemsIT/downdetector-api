@@ -5,7 +5,11 @@ services:
     container_name: downdetector-api
     env_file:
       - .env
+    environment:
+      BROWSER_USER_DATA_DIR: /browser-data
     shm_size: "1gb"
+    volumes:
+      - browser-data:/browser-data
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=traefik"
@@ -23,3 +27,6 @@ networks:
     external: true
   downdetector-network:
     driver: bridge
+
+volumes:
+  browser-data:

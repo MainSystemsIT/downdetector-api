@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     request_timeout_seconds: int = 90
     headless: bool = True
     api_token: str | None = None
+    downdetector_proxy: str | None = None
+    browser_user_data_dir: str | None = None
 
     def downdetector_base_url(self) -> str:
         locale = self.downdetector_locale.strip().lower()

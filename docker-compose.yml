@@ -7,5 +7,12 @@ services:
       - .env
     ports:
       - "8000:8000"
+    environment:
+      BROWSER_USER_DATA_DIR: /browser-data
     shm_size: "1gb"
+    volumes:
+      - browser-data:/browser-data
     restart: unless-stopped
+
+volumes:
+  browser-data:
