@@ -1,0 +1,11 @@
+services:
+  downdetector-api:
+    build: .
+    image: downdetector-api:latest
+    container_name: downdetector-api
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    shm_size: "1gb"
+    restart: unless-stopped

@@ -1,0 +1,724 @@
+import base64
+import re
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
+
+from scrapling.fetchers import StealthySession
+
+from app.config import settings
+from app.models import SERVICE_SLUG_PATTERN, ServiceStatus
+
+_session_lock = threading.Lock()
+_session: StealthySession | None = None
+
+_OK_PATTERNS = (
+    r"no current problems",
+    r"nenhum problema",
+    r"sem problemas",
+)
+_WARNING_PATTERNS = (
+    r"possible problems",
+    r"poss[ií]veis problemas",
+    r"possivel problema",
+)
+_DOWN_PATTERNS = (
+    r"problems at",
+    r"(?<!no current )problems with",
+    r"having problems",
+    r"problemas (?:em|no|na|com)",
+    r"enfrenta problemas",
+    r"est[aá] tendo problemas",
+    r"indicate problems",
+    r"indicam problemas",
+    r"show problems",
+)
+
+
+@dataclass
+class ScrapeResult:
+    service: str
+    status: ServiceStatus
+    label: str
+    message: str
+    source_url: str
+    checked_at: datetime
+    app_image_url: str | None = None
+    failure_graph_image_url: str | None = None
+
+
+def normalize_service(service: str) -> str:
+    slug = service.strip().lower()
+    if not SERVICE_SLUG_PATTERN.match(slug):
+        raise ValueError(
+            "Serviço inválido. Use apenas letras, números, hífen ou underscore "
+            "(ex.: youtube, whatsapp, instagram)."
+        )
+    return slug
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_status_message(page, fallback_url: str) -> tuple[str, str]:
+    source_url = getattr(page, "url", fallback_url)
+
+    status_block = page.css("#company-status h1")
+    if status_block:
+        message = _normalize_text(status_block[0].get_all_text())
+        if message:
+            return message, source_url
+
+    h1 = page.css("h1")
+    if h1:
+        message = _normalize_text(h1[0].get_all_text())
+        if message:
+            return message, source_url
+
+    title = page.css("title::text").get()
+    if title:
+        return _normalize_text(title), source_url
+
+    raise ValueError("Não foi possível localizar o status do serviço na página.")
+
+
+_APP_IMAGE_SELECTORS = (
+    "#company-logo img::attr(src)",
+    "#company-card img::attr(src)",
+    ".company-logo img::attr(src)",
+    ".company-header img::attr(src)",
+    "img[alt*='logo']::attr(src)",
+    "img[alt*='Logo']::attr(src)",
+    "meta[property='og:image']::attr(content)",
+)
+_FAILURE_GRAPH_IMAGE_SELECTORS = (
+    "#chart-row img::attr(src)",
+    "#reports-chart img::attr(src)",
+    ".chart img::attr(src)",
+    ".graph img::attr(src)",
+    ".reports-chart img::attr(src)",
+    "img[alt*='chart']::attr(src)",
+    "img[alt*='Chart']::attr(src)",
+    "img[alt*='graph']::attr(src)",
+    "img[alt*='Graph']::attr(src)",
+    "img[alt*='outage']::attr(src)",
+    "img[alt*='Outage']::attr(src)",
+    "img[alt*='falha']::attr(src)",
+    "img[alt*='Falha']::attr(src)",
+)
+_FAILURE_GRAPH_SVG_SELECTORS = (
+    ".recharts-responsive-container svg.recharts-surface",
+    ".recharts-wrapper svg.recharts-surface",
+)
+_APP_IMAGE_KEYWORDS = ("logo", "company", "app", "icon")
+_FAILURE_GRAPH_IMAGE_KEYWORDS = (
+    "chart",
+    "graph",
+    "outage",
+    "report",
+    "problem",
+    "reports",
+    "falha",
+    "problema",
+)
+_IGNORED_GRAPH_IMAGE_KEYWORDS = (
+    "icon.svg",
+    "country_flags",
+    "avatar",
+    "apple-store",
+    "google-play",
+    "explorer_promo",
+    "dd-app-promo",
+)
+_IMAGE_ATTRS = ("src", "data-src", "data-lazy-src", "data-original")
+_SRCSET_ATTRS = ("srcset", "data-srcset")
+_SVG_TO_JPEG_SCRIPT = r"""
+import base64
+import sys
+
+from playwright.sync_api import sync_playwright
+
+markup = sys.stdin.read().strip()
+if not markup.startswith("<svg"):
+    raise SystemExit(1)
+
+with sync_playwright() as playwright:
+    browser = playwright.chromium.launch(headless=True)
+    try:
+        page = browser.new_page(viewport={"width": 1000, "height": 500})
+        page.set_content(
+            f'''
+            <!doctype html>
+            <html>
+              <body style="margin:0;background:#fff;--color-dd-red:#d71920;">
+                <div id="chart" style="display:inline-block;background:#fff;color:#d71920;">
+                  {markup}
+                </div>
+                <style>
+                  #chart svg {{
+                    background: #fff;
+                    display: block;
+                  }}
+                </style>
+              </body>
+            </html>
+            '''
+        )
+        image_bytes = page.locator("#chart").screenshot(type="jpeg", quality=90)
+    finally:
+        browser.close()
+
+sys.stdout.write(base64.b64encode(image_bytes).decode("ascii"))
+"""
+_CARD_TO_JPEG_SCRIPT = r"""
+import base64
+import sys
+
+from playwright.sync_api import sync_playwright
+
+markup = sys.stdin.read().strip()
+if not markup:
+    raise SystemExit(1)
+
+with sync_playwright() as playwright:
+    browser = playwright.chromium.launch(headless=True)
+    try:
+        page = browser.new_page(viewport={"width": 360, "height": 320})
+        page.set_content(
+            f'''
+            <!doctype html>
+            <html>
+              <head>
+                <style>
+                  :root {{
+                    --color-dd-red: #d71920;
+                    font-family: Arial, Helvetica, sans-serif;
+                  }}
+                  body {{
+                    margin: 0;
+                    background: #fff;
+                  }}
+                  #card-root {{
+                    display: inline-block;
+                    background: #fff;
+                    padding: 0;
+                  }}
+                  #card-root [id^="company-"] {{
+                    box-sizing: border-box;
+                    width: 292px;
+                    min-height: 220px;
+                    background: #fff;
+                    color: #52525b;
+                    border: 1px solid #e4e4e7;
+                    border-radius: 12px;
+                    text-align: center;
+                    overflow: hidden;
+                  }}
+                  #card-root a {{
+                    display: block;
+                    height: 100%;
+                    color: inherit;
+                    text-decoration: none;
+                  }}
+                  #card-root a > div {{
+                    padding: 8px 24px;
+                  }}
+                  #card-root h2 {{
+                    height: 48px;
+                    margin: 0 0 8px;
+                    color: #18181b;
+                    font-size: 16px;
+                    font-weight: 600;
+                    line-height: 22px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    overflow: hidden;
+                  }}
+                  #card-root h2 + div {{
+                    height: 112px;
+                    margin-bottom: 16px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                  }}
+                  #card-root img {{
+                    width: auto;
+                    max-width: 252px;
+                    max-height: 112px;
+                    object-fit: contain;
+                    object-position: center;
+                  }}
+                  #card-root [role="img"] {{
+                    width: 243px;
+                    height: 48px;
+                    margin: 0 auto 8px;
+                    padding: 4px 0;
+                    box-sizing: border-box;
+                    color: #d71920;
+                    overflow: visible;
+                  }}
+                  #card-root svg {{
+                    width: 100%;
+                    height: 40px;
+                    overflow: visible !important;
+                    display: block;
+                  }}
+                  #card-root [role="img"] path,
+                  #card-root [role="img"] line,
+                  #card-root [role="img"] polyline {{
+                    stroke: #d71920 !important;
+                    fill: none !important;
+                    opacity: 1 !important;
+                    visibility: visible !important;
+                  }}
+                </style>
+              </head>
+              <body>
+                <div id="card-root">{markup}</div>
+              </body>
+            </html>
+            '''
+        )
+        page.evaluate(
+            '''() => {
+                document
+                    .querySelectorAll('#card-root [role="img"] svg path, #card-root [role="img"] svg line, #card-root [role="img"] svg polyline')
+                    .forEach((element) => {
+                        const stroke = element.getAttribute('stroke');
+                        if (!stroke || stroke.includes('var(')) {
+                            element.setAttribute('stroke', '#d71920');
+                        }
+                        element.style.stroke = '#d71920';
+                        element.style.fill = 'none';
+                        element.style.opacity = '1';
+                        element.style.visibility = 'visible';
+                    });
+
+                document
+                    .querySelectorAll('#card-root [role="img"], #card-root [role="img"] svg')
+                    .forEach((element) => {
+                        element.style.display = 'block';
+                        element.style.overflow = 'visible';
+                        element.style.opacity = '1';
+                        element.style.visibility = 'visible';
+                    });
+            }'''
+        )
+        page.wait_for_load_state("networkidle", timeout=10000)
+        page.wait_for_function(
+            "Array.from(document.images).every((img) => img.complete)",
+            timeout=10000,
+        )
+        image_bytes = page.locator("#card-root").screenshot(type="jpeg", quality=90)
+    finally:
+        browser.close()
+
+sys.stdout.write(base64.b64encode(image_bytes).decode("ascii"))
+"""
+
+
+def _first_srcset_url(value: str) -> str | None:
+    for candidate in value.split(","):
+        parts = candidate.strip().split()
+        if parts:
+            return parts[0]
+    return None
+
+
+def _absolute_image_url(page, fallback_url: str, value: str | None) -> str | None:
+    if not value:
+        return None
+
+    raw_value = value.strip()
+    raw_url = (
+        _first_srcset_url(raw_value)
+        if "," in raw_value or " " in raw_value
+        else raw_value
+    )
+    if not raw_url or raw_url.startswith("data:"):
+        return None
+
+    source_url = getattr(page, "url", fallback_url) or fallback_url
+    return urljoin(source_url, raw_url)
+
+
+def _image_url_from_element(page, fallback_url: str, image) -> str | None:
+    attributes = getattr(image, "attrib", {})
+
+    for attr in _IMAGE_ATTRS:
+        url = _absolute_image_url(page, fallback_url, attributes.get(attr))
+        if url:
+            return url
+
+    for attr in _SRCSET_ATTRS:
+        url = _absolute_image_url(page, fallback_url, attributes.get(attr))
+        if url:
+            return url
+
+    return None
+
+
+def _extract_image_by_selectors(
+    page,
+    fallback_url: str,
+    selectors: tuple[str, ...],
+) -> str | None:
+    for selector in selectors:
+        url = _absolute_image_url(page, fallback_url, page.css(selector).get())
+        if url:
+            return url
+    return None
+
+
+def _extract_image_by_keywords(
+    page,
+    fallback_url: str,
+    keywords: tuple[str, ...],
+    ignored_keywords: tuple[str, ...] = (),
+) -> str | None:
+    for image in page.css("img"):
+        attributes = getattr(image, "attrib", {})
+        haystack = " ".join(
+            str(value).lower() for value in attributes.values() if value
+        )
+        if any(keyword in haystack for keyword in keywords):
+            url = _image_url_from_element(page, fallback_url, image)
+            if url and not any(
+                ignored in url.lower() for ignored in ignored_keywords
+            ):
+                return url
+
+    return None
+
+
+def _svg_to_jpeg_data_url(svg_markup: str | None) -> str | None:
+    if not svg_markup:
+        return None
+
+    markup = svg_markup.strip()
+    if not markup.startswith("<svg"):
+        return None
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _SVG_TO_JPEG_SCRIPT],
+            input=markup,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=settings.request_timeout_seconds,
+        )
+    except Exception:
+        return None
+
+    encoded = completed.stdout.strip()
+    if completed.returncode != 0 or not encoded:
+        return None
+
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _card_html_to_jpeg_data_url(card_markup: str | None) -> str | None:
+    if not card_markup:
+        return None
+
+    markup = card_markup.strip()
+    if not markup:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _CARD_TO_JPEG_SCRIPT],
+            input=markup,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=settings.request_timeout_seconds,
+        )
+    except Exception:
+        return None
+
+    encoded = completed.stdout.strip()
+    if completed.returncode != 0 or not encoded:
+        return None
+
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _extract_svg_by_selectors(page, selectors: tuple[str, ...]) -> str | None:
+    for selector in selectors:
+        data_url = _svg_to_jpeg_data_url(page.css(selector).get())
+        if data_url:
+            return data_url
+    return None
+
+
+def _service_path(service: str) -> str:
+    return urlparse(settings.urls_for_service(service)[0]).path.rstrip("/") + "/"
+
+
+def _card_matches_service(card_link, fallback_url: str, service: str) -> bool:
+    href = getattr(card_link, "attrib", {}).get("href")
+    if not href:
+        return False
+
+    expected_path = _service_path(service)
+    href_path = urlparse(urljoin(fallback_url, href)).path.rstrip("/") + "/"
+    return href_path == expected_path
+
+
+def _company_card_markup(card_link) -> str | None:
+    element = card_link
+    while element is not None:
+        element_id = getattr(element, "attrib", {}).get("id", "")
+        if element_id.startswith("company-"):
+            return element.get()
+        element = element.parent
+
+    return card_link.get()
+
+
+def _extract_card_image_urls(
+    page,
+    fallback_url: str,
+    service: str,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    for card_link in page.css("a[href]"):
+        if not _card_matches_service(card_link, fallback_url, service):
+            continue
+
+        href = getattr(card_link, "attrib", {}).get("href")
+        source_url = urljoin(fallback_url, href) if href else fallback_url
+        app_image_url = None
+        card_images = card_link.css("img")
+        if card_images:
+            app_image_url = _image_url_from_element(page, fallback_url, card_images[0])
+
+        graph_block = card_link.css("[role='img']")
+        message = None
+        if graph_block:
+            message = getattr(graph_block[0], "attrib", {}).get("aria-label")
+
+        graph_svg = graph_block[0].css("svg").get() if graph_block else None
+        graph_svg = graph_svg or card_link.css("svg").get()
+        failure_graph_image_url = _card_html_to_jpeg_data_url(
+            _company_card_markup(card_link)
+        ) or _svg_to_jpeg_data_url(graph_svg)
+        return app_image_url, failure_graph_image_url, message, source_url
+
+    return None, None, None, None
+
+
+def _extract_image_urls(page, fallback_url: str) -> tuple[str | None, str | None]:
+    app_image_url = _extract_image_by_selectors(
+        page,
+        fallback_url,
+        _APP_IMAGE_SELECTORS,
+    ) or _extract_image_by_keywords(page, fallback_url, _APP_IMAGE_KEYWORDS)
+    failure_graph_image_url = _extract_svg_by_selectors(
+        page,
+        _FAILURE_GRAPH_SVG_SELECTORS,
+    ) or _extract_image_by_selectors(
+        page,
+        fallback_url,
+        _FAILURE_GRAPH_IMAGE_SELECTORS,
+    ) or _extract_image_by_keywords(
+        page,
+        fallback_url,
+        _FAILURE_GRAPH_IMAGE_KEYWORDS,
+        _IGNORED_GRAPH_IMAGE_KEYWORDS,
+    )
+
+    return app_image_url, failure_graph_image_url
+
+
+def _fetch_service_card_image_urls(service: str) -> tuple[str | None, str | None]:
+    home_url = f"{settings.downdetector_base_url().rstrip('/')}/"
+    try:
+        page = _get_session().fetch(home_url)
+    except Exception:
+        return None, None
+
+    if getattr(page, "status", 200) >= 400:
+        return None, None
+
+    app_image_url, failure_graph_image_url, _message, _source_url = (
+        _extract_card_image_urls(page, home_url, service)
+    )
+    return app_image_url, failure_graph_image_url
+
+
+def _fetch_service_card_result(service: str) -> ScrapeResult | None:
+    home_url = f"{settings.downdetector_base_url().rstrip('/')}/"
+    try:
+        page = _get_session().fetch(home_url)
+    except Exception:
+        return None
+
+    if getattr(page, "status", 200) >= 400:
+        return None
+
+    app_image_url, failure_graph_image_url, message, source_url = (
+        _extract_card_image_urls(page, home_url, service)
+    )
+    if not message or not source_url:
+        return None
+
+    status = classify_status(message)
+    return ScrapeResult(
+        service=service,
+        status=status,
+        label=status_label(status),
+        message=message,
+        source_url=source_url,
+        checked_at=datetime.now(timezone.utc),
+        app_image_url=app_image_url,
+        failure_graph_image_url=failure_graph_image_url,
+    )
+
+
+def classify_status(message: str) -> ServiceStatus:
+    text = message.lower()
+
+    if any(re.search(p, text) for p in _OK_PATTERNS):
+        return ServiceStatus.OK
+    if any(re.search(p, text) for p in _WARNING_PATTERNS):
+        return ServiceStatus.WARNING
+    if any(re.search(p, text) for p in _DOWN_PATTERNS):
+        return ServiceStatus.DOWN
+
+    if "no current problems" in text or "nenhum problema" in text:
+        return ServiceStatus.OK
+
+    return ServiceStatus.OK
+
+
+def status_label(status: ServiceStatus) -> str:
+    return {
+        ServiceStatus.OK: "bom",
+        ServiceStatus.WARNING: "instável",
+        ServiceStatus.DOWN: "ruim",
+        ServiceStatus.UNKNOWN: "bom",
+    }[status]
+
+
+def _reset_session() -> None:
+    global _session
+    with _session_lock:
+        if _session is not None:
+            try:
+                _session.close()
+            except Exception:
+                pass
+            _session = None
+
+
+def _get_session() -> StealthySession:
+    global _session
+    with _session_lock:
+        if _session is None:
+            _session = StealthySession(
+                headless=settings.headless,
+                network_idle=True,
+                solve_cloudflare=True,
+                timeout=settings.request_timeout_seconds * 1000,
+                locale=settings.browser_locale,
+                wait_selector="#company-status h1, h1",
+                wait_selector_state="visible",
+            )
+            _session.start()
+        return _session
+
+
+def fetch_service_status(service: str, max_attempts: int = 3) -> ScrapeResult:
+    slug = normalize_service(service)
+    urls = settings.urls_for_service(slug)
+    last_error: Exception | None = None
+
+    for url in urls:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                page = _get_session().fetch(url)
+
+                if getattr(page, "status", 200) >= 400:
+                    if page.status in (403, 429):
+                        fallback_result = _fetch_service_card_result(slug)
+                        if fallback_result is not None:
+                            return fallback_result
+
+                    raise RuntimeError(
+                        f"Downdetector retornou HTTP {page.status} para {url}"
+                    )
+
+                message, source_url = _extract_status_message(page, url)
+                app_image_url, failure_graph_image_url = _extract_image_urls(
+                    page,
+                    source_url,
+                )
+                card_app_image_url, card_failure_graph_image_url = (
+                    _fetch_service_card_image_urls(slug)
+                )
+                app_image_url = card_app_image_url or app_image_url
+                failure_graph_image_url = (
+                    card_failure_graph_image_url or failure_graph_image_url
+                )
+                status = classify_status(message)
+
+                return ScrapeResult(
+                    service=slug,
+                    status=status,
+                    label=status_label(status),
+                    message=message,
+                    source_url=source_url,
+                    checked_at=datetime.now(timezone.utc),
+                    app_image_url=app_image_url,
+                    failure_graph_image_url=failure_graph_image_url,
+                )
+            except Exception as exc:
+                last_error = exc
+                _reset_session()
+                if attempt < max_attempts:
+                    time.sleep(3 * attempt)
+
+    fallback_result = _fetch_service_card_result(slug)
+    if fallback_result is not None:
+        return fallback_result
+
+    raise RuntimeError(
+        f"Falha ao consultar o Downdetector para '{slug}': {last_error}"
+    ) from last_error
+
+
+class StatusCache:
+    def __init__(self, ttl_seconds: int) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._entries: dict[str, tuple[ScrapeResult, float]] = {}
+        self._lock = threading.Lock()
+
+    def get(
+        self, service: str, force_refresh: bool = False
+    ) -> tuple[ScrapeResult, bool]:
+        slug = normalize_service(service)
+        now = time.monotonic()
+
+        with self._lock:
+            if not force_refresh and slug in self._entries:
+                result, expires_at = self._entries[slug]
+                if now < expires_at:
+                    return result, True
+
+        result = fetch_service_status(slug)
+
+        with self._lock:
+            self._entries[slug] = (result, now + self.ttl_seconds)
+
+        return result, False
+
+
+status_cache = StatusCache(settings.cache_ttl_seconds)
