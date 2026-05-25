@@ -8,17 +8,18 @@ services:
     shm_size: "1gb"
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik}"
+      - "traefik.docker.network=traefik"
       - "traefik.http.routers.downdetector-api.rule=Host(`${TRAEFIK_HOST:?Configure TRAEFIK_HOST no .env}`)"
       - "traefik.http.routers.downdetector-api.entrypoints=websecure"
-      - "traefik.http.routers.downdetector-api.tls=true"
-      - "traefik.http.routers.downdetector-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.downdetector-api.tls.certresolver=le"
       - "traefik.http.services.downdetector-api.loadbalancer.server.port=8000"
     networks:
-      - web
+      - traefik
+      - downdetector-network
     restart: unless-stopped
 
 networks:
-  web:
-    name: ${TRAEFIK_NETWORK:-traefik}
+  traefik:
     external: true
+  downdetector-network:
+    driver: bridge

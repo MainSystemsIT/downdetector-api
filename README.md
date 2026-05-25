@@ -110,14 +110,13 @@ Configure no `.env`:
 
 ```env
 TRAEFIK_HOST=api.seudominio.com
-TRAEFIK_NETWORK=traefik
 ```
 
 Garanta que:
 
 - o DNS de `TRAEFIK_HOST` aponta para o servidor;
-- o Traefik existente já está conectado na rede Docker definida em `TRAEFIK_NETWORK`;
-- o certificado TLS/certresolver `letsencrypt` já está configurado no seu Traefik.
+- a rede Docker externa `traefik` já existe;
+- o certificado TLS/certresolver `le` já está configurado no seu Traefik.
 
 Depois execute:
 
