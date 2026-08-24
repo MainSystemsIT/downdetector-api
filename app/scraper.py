@@ -245,14 +245,19 @@ with sync_playwright() as playwright:
                     border-radius: 12px;
                     text-align: center;
                     overflow: hidden;
+                    position: relative;
+                    display: flex;
+                    flex-direction: column;
                   }}
                   #card-root a {{
-                    display: block;
-                    height: 100%;
                     color: inherit;
                     text-decoration: none;
                   }}
-                  #card-root a > div {{
+                  #card-root a.absolute {{
+                    display: none;
+                  }}
+                  #card-root a > div,
+                  #card-root [id^="company-"] > div > div {{
                     padding: 8px 24px;
                   }}
                   #card-root h2 {{
@@ -264,10 +269,12 @@ with sync_playwright() as playwright:
                     line-height: 22px;
                     display: flex;
                     align-items: center;
-                    justify-content: center;
+                    justify-content: flex-start;
                     overflow: hidden;
+                    text-align: left;
                   }}
-                  #card-root h2 + div {{
+                  #card-root h2 + div,
+                  #card-root [id^="company-"] .flex-1.min-h-0 {{
                     height: 112px;
                     margin-bottom: 16px;
                     display: flex;
@@ -318,7 +325,9 @@ with sync_playwright() as playwright:
                     const label = (element.getAttribute('aria-label') || '').toLowerCase();
                     if (
                         label.includes('sem problemas') ||
-                        label.includes('no current problems')
+                        label.includes('no current problems') ||
+                        label.includes('não mostram') ||
+                        label.includes('nao mostram')
                     ) {
                         return '#16a34a';
                     }
@@ -540,14 +549,25 @@ def _card_matches_service(card_link, fallback_url: str, service: str) -> bool:
     return href_path == expected_path
 
 
-def _company_card_markup(card_link) -> str | None:
+def _company_card_element(card_link):
+    """Sobe até o container `company-*` do card na home.
+
+    No DOM atual o `<a>` é absoluto/vazio e logo/gráfico ficam como irmãos,
+    então a busca precisa ser no card pai e não só dentro do link.
+    """
     element = card_link
     while element is not None:
         element_id = getattr(element, "attrib", {}).get("id", "")
         if element_id.startswith("company-"):
-            return element.get()
+            return element
         element = element.parent
+    return None
 
+
+def _company_card_markup(card_link) -> str | None:
+    card = _company_card_element(card_link)
+    if card is not None:
+        return card.get()
     return card_link.get()
 
 
@@ -582,7 +602,8 @@ def _extract_service_card(
     if not slug:
         return None
 
-    graph_block = card_link.css("[role='img']")
+    card_root = _company_card_element(card_link) or card_link
+    graph_block = card_root.css("[role='img']")
     if not graph_block:
         return None
 
@@ -590,13 +611,13 @@ def _extract_service_card(
     if not message:
         return None
 
-    markup = _company_card_markup(card_link)
+    markup = card_root.get() if card_root is not None else None
     if not markup:
         return None
 
     href = getattr(card_link, "attrib", {}).get("href")
     source_url = urljoin(fallback_url, href) if href else fallback_url
-    card_images = card_link.css("img")
+    card_images = card_root.css("img")
     app_image_url = (
         _image_url_from_element(page, fallback_url, card_images[0])
         if card_images
@@ -627,12 +648,7 @@ def _extract_card_image_urls(
         card = _extract_service_card(page, fallback_url, card_link)
         if card is None:
             return None, None, None, None
-        graph_block = card_link.css("[role='img']")
-        graph_svg = graph_block[0].css("svg").get() if graph_block else None
-        graph_svg = graph_svg or card_link.css("svg").get()
-        failure_graph_image_url = _card_html_to_jpeg_data_url(
-            card.card_markup
-        ) or _svg_to_jpeg_data_url(graph_svg)
+        failure_graph_image_url = _card_html_to_jpeg_data_url(card.card_markup)
         return (
             card.app_image_url,
             failure_graph_image_url,
@@ -843,7 +859,7 @@ def fetch_service_status(service: str, max_attempts: int = 3) -> ScrapeResult:
                     )
 
                 message, source_url = _extract_status_message(page, url)
-                app_image_url, failure_graph_image_url = _extract_image_urls(
+                app_image_url, page_failure_graph_image_url = _extract_image_urls(
                     page,
                     source_url,
                 )
@@ -852,7 +868,7 @@ def fetch_service_status(service: str, max_attempts: int = 3) -> ScrapeResult:
                 )
                 app_image_url = card_app_image_url or app_image_url
                 failure_graph_image_url = (
-                    card_failure_graph_image_url or failure_graph_image_url
+                    card_failure_graph_image_url or page_failure_graph_image_url
                 )
                 status = classify_status(message)
 
