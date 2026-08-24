@@ -21,9 +21,10 @@ from app.scraper import (
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    yield
-    from app.scraper import _reset_session
+    from app.scraper import _clear_browser_profile_locks, _reset_session
 
+    _clear_browser_profile_locks()
+    yield
     _reset_session()
 
 

@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from scrapling.fetchers import StealthySession
@@ -14,7 +15,13 @@ from app.config import settings
 from app.models import SERVICE_SLUG_PATTERN, ServiceStatus
 
 _session_lock = threading.Lock()
+_browser_lock = threading.Lock()
 _session: StealthySession | None = None
+_PROFILE_SINGLETON_NAMES = (
+    "SingletonLock",
+    "SingletonCookie",
+    "SingletonSocket",
+)
 
 _OK_PATTERNS = (
     r"no current problems",
@@ -731,6 +738,14 @@ def fetch_critical_services(
     limit: int = 5,
     max_attempts: int = 3,
 ) -> CriticalServicesResult:
+    with _browser_lock:
+        return _fetch_critical_services_locked(limit, max_attempts)
+
+
+def _fetch_critical_services_locked(
+    limit: int = 5,
+    max_attempts: int = 3,
+) -> CriticalServicesResult:
     home_url = f"{settings.downdetector_base_url().rstrip('/')}/"
     last_error: Exception | None = None
 
@@ -803,6 +818,57 @@ def status_label(status: ServiceStatus) -> str:
     }[status]
 
 
+def _clear_browser_profile_locks(user_data_dir: str | None = None) -> None:
+    """Remove locks residuais do Chromium em perfis persistentes.
+
+    Após crash/restart, o SingletonLock impede um novo launch no mesmo
+    `user_data_dir` (comum em Docker com volume `/browser-data`).
+    """
+    root = user_data_dir or settings.browser_user_data_dir
+    if not root:
+        return
+
+    profile = Path(root)
+    if not profile.is_dir():
+        return
+
+    for name in _PROFILE_SINGLETON_NAMES:
+        lock_path = profile / name
+        try:
+            if lock_path.is_symlink() or lock_path.exists():
+                lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _is_profile_lock_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "processsingleton" in message
+        or "singletonlock" in message
+        or "profile directory" in message
+        or "profile is already in use" in message
+    )
+
+
+def _build_session_kwargs(*, use_user_data_dir: bool = True) -> dict:
+    session_kwargs = {
+        "headless": settings.headless,
+        "network_idle": True,
+        "solve_cloudflare": True,
+        "timeout": settings.request_timeout_seconds * 1000,
+        "locale": settings.browser_locale,
+        "wait_selector": "#company-status h1, h1",
+        "wait_selector_state": "visible",
+        "block_webrtc": bool(settings.downdetector_proxy),
+    }
+    if settings.downdetector_proxy:
+        session_kwargs["proxy"] = settings.downdetector_proxy
+    if use_user_data_dir and settings.browser_user_data_dir:
+        session_kwargs["user_data_dir"] = settings.browser_user_data_dir
+    return session_kwargs
+
+
 def _reset_session() -> None:
     global _session
     with _session_lock:
@@ -812,33 +878,61 @@ def _reset_session() -> None:
             except Exception:
                 pass
             _session = None
+        # Dá tempo do Chromium liberar o perfil antes de limpar o lock.
+        time.sleep(0.5)
+        _clear_browser_profile_locks()
 
 
 def _get_session() -> StealthySession:
     global _session
     with _session_lock:
-        if _session is None:
-            session_kwargs = {
-                "headless": settings.headless,
-                "network_idle": True,
-                "solve_cloudflare": True,
-                "timeout": settings.request_timeout_seconds * 1000,
-                "locale": settings.browser_locale,
-                "wait_selector": "#company-status h1, h1",
-                "wait_selector_state": "visible",
-                "block_webrtc": bool(settings.downdetector_proxy),
-            }
-            if settings.downdetector_proxy:
-                session_kwargs["proxy"] = settings.downdetector_proxy
-            if settings.browser_user_data_dir:
-                session_kwargs["user_data_dir"] = settings.browser_user_data_dir
+        if _session is not None:
+            return _session
 
-            _session = StealthySession(**session_kwargs)
-            _session.start()
-        return _session
+        _clear_browser_profile_locks()
+        last_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                session = StealthySession(
+                    **_build_session_kwargs(use_user_data_dir=True)
+                )
+                session.start()
+                _session = session
+                return _session
+            except Exception as exc:
+                last_error = exc
+                if _is_profile_lock_error(exc):
+                    _clear_browser_profile_locks()
+                    time.sleep(0.5)
+                    continue
+                break
+
+        # Perfil persistente indisponível: sobe sessão efêmera.
+        if settings.browser_user_data_dir:
+            try:
+                session = StealthySession(
+                    **_build_session_kwargs(use_user_data_dir=False)
+                )
+                session.start()
+                _session = session
+                return _session
+            except Exception as exc:
+                last_error = exc
+
+        raise RuntimeError(
+            f"Falha ao iniciar o navegador: {last_error}"
+        ) from last_error
 
 
 def fetch_service_status(service: str, max_attempts: int = 3) -> ScrapeResult:
+    with _browser_lock:
+        return _fetch_service_status_locked(service, max_attempts)
+
+
+def _fetch_service_status_locked(
+    service: str, max_attempts: int = 3
+) -> ScrapeResult:
     slug = normalize_service(service)
     urls = settings.urls_for_service(slug)
     last_error: Exception | None = None
