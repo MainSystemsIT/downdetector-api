@@ -42,6 +42,10 @@ class CriticalServiceItem(BaseModel):
         default=None,
         description="URL da imagem/logo do aplicativo no Downdetector",
     )
+    failure_graph_image_url: str | None = Field(
+        default=None,
+        description="Data URL JPEG do card do serviço na tela principal",
+    )
 
 
 class CriticalServicesResponse(BaseModel):

@@ -67,6 +67,7 @@ class CriticalServiceCard:
     source_url: str
     app_image_url: str | None
     card_markup: str
+    failure_graph_image_url: str | None = None
 
 
 @dataclass
@@ -783,6 +784,8 @@ def _fetch_critical_services_locked(
 
     ranked_cards.sort(key=lambda item: (item[0], item[1]))
     services = [card for _rank, _index, card in ranked_cards[:limit]]
+    for card in services:
+        card.failure_graph_image_url = _card_html_to_jpeg_data_url(card.card_markup)
     image_url = _cards_html_to_jpeg_data_url([card.card_markup for card in services])
 
     return CriticalServicesResult(

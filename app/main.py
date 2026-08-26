@@ -108,6 +108,7 @@ def _get_critical_services(count: int, refresh: bool) -> CriticalServicesRespons
                 message=service.message,
                 source_url=service.source_url,
                 app_image_url=service.app_image_url,
+                failure_graph_image_url=service.failure_graph_image_url,
             )
             for service in result.services
         ],
